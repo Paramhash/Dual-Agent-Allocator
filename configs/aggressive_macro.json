@@ -1,0 +1,7 @@
+{
+    "experiment_name": "aggressive_macro",
+    "max_turnover": 0.15,
+    "lambda_variance": 0.10,
+    "lambda_drawdown": 0.50,
+    "transaction_costs": {"ES3.SI": 0.0010, "A35.SI": 0.0010, "CLR.SI": 0.0015}
+}

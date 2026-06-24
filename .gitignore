@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Generated artifacts — not committed; reproduce locally
+data/
+models/
+logs/
+results/*
+
+# File types that should never land in git history
+*.zip
+*.pkl
+*.parquet
+*.html
+
+# Keep the evaluation screenshot for the README
+*.png
+!results/evaluation.png
