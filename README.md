@@ -1,41 +1,84 @@
 # Dual-Agent Allocator
 
-A config-driven reinforcement learning portfolio manager that trains two distinct trading personas — a conservative and an aggressive macro agent — on three Singapore-listed ETFs. Each agent learns a daily rebalancing policy via Proximal Policy Optimization (PPO), maximising risk-adjusted compounding returns under explicit turnover and drawdown constraints.
+A Hierarchical Reinforcement Learning (HRL) portfolio manager with two specialised PPO agents that operate on different cadences and different data sources.
 
-## Asset Universe
+**Layer 1 — Macro Governor** runs daily and sets the top-level risk budget: how much capital goes to equities vs. safe harbor (TLT).
 
-| Ticker | Asset | Notes |
-|--------|-------|-------|
-| ES3.SI | SPDR STI ETF | SG equities, ~15yr history, ~3% yield |
-| A35.SI | ABF Singapore Bond Index Fund | SG government bonds |
-| CLR.SI | Lion-Phillip S-REIT ETF | S-REITs, inception ~2017 |
+**Layer 2 — Micro Selector** runs monthly and, assuming a 100% equity mandate, picks the 10 Nasdaq stocks most likely to outperform the equal-weight benchmark next month.
 
-## Results (Baseline Conservative, out-of-sample Mar 2025 – Jun 2026)
+At each monthly rebalance the two outputs are combined:
 
-The conservative agent outperforms a daily-rebalanced 1/N equal-weight benchmark over the test window — final NAV ~1.235 vs ~1.185 — while maintaining lower drawdown through a persistent tilt toward REITs and bonds.
+```
+Final Allocation = W_Equity × (equal-weight top-10 Nasdaq picks)
+                + W_Safe   × TLT
+```
 
-![Evaluation chart](results/evaluation.png)
+## Architecture
 
-## Agents
+```
+┌─────────────────────────────────────────────────────────┐
+│                 LAYER 1: MACRO GOVERNOR                  │
+│  Cadence : Daily                                         │
+│  Input   : 5 macro features (SPY, TLT, VIX, TNX, IRX,  │
+│            DBC → Macro_Trend, Vol_Shock, Yield_Spread,  │
+│            Bond_Eq_Corr, Inflation_Trend)                │
+│  Output  : W_Equity  ←→  W_Safe  (sum = 1)              │
+│  Mapping : W_Eq = (action + 1) / 2  [linear, not        │
+│            softmax — preserves 0% and 100% extremes]     │
+└──────────────────────┬──────────────────────────────────┘
+                       │ W_Equity budget scalar
+┌──────────────────────▼──────────────────────────────────┐
+│                 LAYER 2: MICRO SELECTOR                  │
+│  Cadence : Monthly                                       │
+│  Input   : (N_Tickers × 5) cross-sectional feature      │
+│            matrix — Mom_90, Stretch, Downside_Var,       │
+│            CMF, StochRSI — z-scored across universe      │
+│  Output  : Score logit per stock → Top-10 by argsort    │
+│  Universe: ~73 Nasdaq stocks (survival-filtered)         │
+└─────────────────────────────────────────────────────────┘
+```
 
-Two personas ship out of the box. Reward hyperparameters live entirely in `configs/` — no code changes needed to experiment with different risk profiles.
+## Macro Features (Layer 1)
+
+| Feature | Formula |
+|---|---|
+| `Macro_Trend` | `(SPY − SMA200_SPY) / SMA200_SPY` |
+| `Vol_Shock` | `VIX / SMA21_VIX` |
+| `Yield_Spread` | `TNX − IRX` (10Y − 3M yield spread) |
+| `Bond_Eq_Corr` | 63-day rolling Pearson corr(SPY_ret, TLT_ret) |
+| `Inflation_Trend` | `(DBC − SMA200_DBC) / SMA200_DBC` |
+
+## Micro Features (Layer 2)
+
+| Feature | Formula |
+|---|---|
+| `Mom_90` | 90-day price return |
+| `Stretch` | `(Close − SMA50) / SMA50` |
+| `Downside_Var` | 30-day rolling std of negative-only daily returns |
+| `CMF` | 20-day Chaikin Money Flow |
+| `StochRSI` | 14-day Stochastic RSI k-line |
+
+All five features are cross-sectionally z-scored per date so the model sees relative signals, not absolute price levels.
+
+## Personas
+
+Behaviour is controlled entirely by JSON configs — no code changes needed.
 
 | Config | `lambda_variance` | `lambda_drawdown` | `max_turnover` | Character |
-|--------|:-----------------:|:-----------------:|:--------------:|-----------|
-| `baseline_conservative.json` | 0.50 | 1.00 | 10% | Hugs the index, avoids deep losses |
-| `aggressive_macro.json` | 0.10 | 0.50 | 15% | Sharper rotational bets, higher variance tolerance |
+|---|:-:|:-:|:-:|---|
+| `baseline_conservative.json` | 0.50 | 1.00 | 10% | Low variance, drawdown-averse |
+| `aggressive_macro.json` | 0.10 | 0.50 | 15% | Sharper rotational bets |
 
-To add a third persona, create a new JSON in `configs/` with five fields: `experiment_name`, `max_turnover`, `lambda_variance`, `lambda_drawdown`, `transaction_costs`.
+The reward function is:
 
-## How It Works
+```
+R = portfolio_return
+    − λ_variance  × rolling_21d_variance
+    − λ_drawdown  × current_drawdown_depth
+    − turnover_friction
+```
 
-**Observation (13-dim):** 21-day vol × 3, 63-day vol × 3, 63-day momentum × 3, S-REIT yield spread, current weights × 3. Features are z-scored using statistics computed over the training set only.
-
-**Action:** Raw 3-dim logits → softmax projection guarantees `∑w = 1, w ≥ 0` without clipping. A turnover clamp is applied before execution as a hard structural constraint (not a reward penalty).
-
-**Reward:** `portfolio_return − λ_variance × rolling_variance − λ_drawdown × drawdown_depth − transaction_costs`
-
-**Training:** PPO with 4 parallel workers sampling random 252-day episodes. `VecNormalize` maintains running observation statistics. The last 15% of the dataset (chronological) is held out as the test set and never seen during training.
+`max_turnover` is a hard structural constraint applied before the reward — not just a penalty.
 
 ## Setup
 
@@ -43,32 +86,85 @@ To add a third persona, create a new JSON in `configs/` with five fields: `exper
 python -m venv .venv
 .venv\Scripts\activate        # Linux/Mac: source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# Fetch 15 years of daily market data (cached to data/market_data.parquet)
+## Pipeline
+
+### 1. Build data caches
+
+```bash
+# Layer 1: downloads 6 macro proxies, engineers 5 features → data/macro_data.parquet
 python data_loader.py
+
+# Layer 2: downloads ~73 Nasdaq tickers, engineers 5 features → data/layer2_states.npy
+python data_loader_layer2.py
 ```
 
-> **Note:** `curl_cffi` is required for reliable `.SI` ticker downloads. Without it, Yahoo Finance's JA3/JA4 bot-detection aggressively rate-limits Singapore tickers.
+Both scripts use `curl_cffi` with Chrome impersonation to bypass Yahoo Finance rate-limits. Data is cached so training never re-fetches the same rows.
 
-## Usage
+### 2. Train
 
-**Train an agent:**
 ```bash
-python train.py --config configs/baseline_conservative.json
+# Layer 1 — Macro Governor
 python train.py --config configs/aggressive_macro.json
+python train.py --config configs/baseline_conservative.json
+
+# Layer 2 — Micro Selector (exploits 32-thread CPUs via SubprocVecEnv)
+python train_layer2.py
 ```
 
-**Train and immediately evaluate out-of-sample:**
+Optional training flags:
+
 ```bash
-python train.py --config configs/baseline_conservative.json --eval
+python train.py --config configs/aggressive_macro.json --timesteps 200000 --n-envs 8 --seed 0
+python train.py --config configs/aggressive_macro.json --eval        # train then evaluate
+python train.py --config configs/aggressive_macro.json --eval-only   # skip training
 ```
 
-**Evaluate a saved policy (opens interactive Plotly chart in browser):**
+### 3. Evaluate out-of-sample
+
+Runs the combined dual-agent system over the chronological 15% holdout, prints monthly returns vs. SPY and NDX equal-weight benchmarks, and saves a chart.
+
 ```bash
-python evaluate.py --config configs/baseline_conservative.json
+python evaluate_dual_agent.py
+# → results/dual_agent_backtest.png
+# → results/dual_agent_backtest.csv
 ```
 
-**Compare both agents side-by-side in TensorBoard:**
+### 4. Live inference
+
+Downloads today's market data, runs both frozen policies, and prints a trading ticket for the current month.
+
+```bash
+python live_inference.py
+```
+
+Example output:
+
+```
+=========================================
+LIVE DUAL-AGENT INFERENCE (Date: 2026-06-27)
+
+MACRO GOVERNOR (Layer 1):
+
+  Target Equity Weight : 72.4%
+
+  Target Safe Weight   : 27.6% (TLT / Cash)
+
+MICRO SELECTOR (Layer 2) - TOP 10 BUYS:
+
+  NVDA
+
+  MSFT
+  ...
+
+  CRWD
+
+=========================================
+```
+
+### 5. Monitor training
+
 ```bash
 tensorboard --logdir logs/
 ```
@@ -76,11 +172,23 @@ tensorboard --logdir logs/
 ## Project Structure
 
 ```
-configs/              Hyperparameter files — one JSON per agent persona
-data_loader.py        Downloads prices from yfinance, engineers features, caches to parquet
-sg_portfolio_env.py   Gymnasium Box→Box environment: state, action, reward logic
-train.py              PPO training loop with checkpointing and eval callbacks
-evaluate.py           Deterministic out-of-sample rollout with interactive Plotly chart
+configs/
+  aggressive_macro.json         ← persona: high risk tolerance
+  baseline_conservative.json    ← persona: drawdown-averse
+
+data_loader.py                  ← Layer 1 macro data pipeline
+data_loader_layer2.py           ← Layer 2 micro data pipeline
+
+envs/
+  layer1_macro_env.py           ← Gymnasium env: daily macro allocation
+  layer2_micro_env.py           ← Gymnasium env: monthly stock ranking
+
+train.py                        ← Layer 1 PPO training
+train_layer2.py                 ← Layer 2 PPO training (SubprocVecEnv)
+
+evaluate_dual_agent.py          ← Combined OOS backtest + chart
+live_inference.py               ← Production trading ticket generator
+
 requirements.txt
 ```
 
@@ -88,28 +196,39 @@ Generated at runtime (gitignored): `data/`, `models/`, `logs/`, `results/`
 
 ## Artifact Layout
 
-Each agent's artifacts are namespaced by `experiment_name` so both can coexist:
-
 ```
 models/
-  {exp_name}_policy.zip           ← frozen PPO policy
-  {exp_name}_vec_normalise.pkl    ← VecNormalize running statistics (load alongside policy)
-  checkpoints/{exp_name}/         ← periodic snapshots
-  best/{exp_name}/                ← best checkpoint by eval reward
+  layer1_{exp_name}_policy.zip          ← frozen Layer 1 policy
+  layer1_{exp_name}_vec_normalise.pkl   ← Layer 1 VecNormalize stats
+  layer2_micro_policy.zip               ← frozen Layer 2 policy
+  layer2_vec_normalise.pkl              ← Layer 2 VecNormalize stats
+  checkpoints/                          ← periodic snapshots
+  best/                                 ← best checkpoint by eval reward
 logs/
-  PPO_{exp_name}_N/               ← TensorBoard event files
+  PPO_layer1_{exp_name}_N/              ← TensorBoard runs
+  PPO_layer2_N/
 results/
-  evaluation.html                 ← interactive Plotly chart (last run)
+  dual_agent_backtest.png               ← equity curve chart
+  dual_agent_backtest.csv               ← monthly return ledger
+data/
+  macro_data.parquet                    ← Layer 1 feature cache
+  layer2_states.npy                     ← Layer 2 state tensor (Months × Tickers × 5)
+  layer2_returns.npy                    ← Layer 2 return tensor (Months × Tickers)
+  layer2_meta.json                      ← ordered ticker list + monthly dates
 ```
+
+> **Important:** Each `.pkl` normaliser is policy-specific. Always load the `.zip` and its matching `.pkl` together. Loading a normaliser from a different training run will produce incorrect observations and silent performance degradation.
 
 ## Dependencies
 
 | Package | Role |
-|---------|------|
+|---|---|
 | `stable-baselines3` | PPO implementation |
 | `gymnasium` | RL environment interface |
 | `torch` | Neural network backend |
-| `curl_cffi` | Chrome-impersonation HTTP for `.SI` tickers |
 | `yfinance` | Market data source |
-| `plotly` | Interactive evaluation charts |
+| `curl_cffi` | Chrome-impersonation HTTP — required for reliable downloads |
+| `numpy` / `pandas` | Data manipulation |
+| `scipy` | Softmax utility |
+| `pyarrow` | Parquet read/write |
 | `tensorboard` | Training run visualisation |
