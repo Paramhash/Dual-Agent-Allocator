@@ -80,6 +80,25 @@ R = portfolio_return
 
 `max_turnover` is a hard structural constraint applied before the reward — not just a penalty.
 
+## Out-of-Sample Results
+
+Backtest window: **March 2024 – April 2026** (26 months, chronological 15% holdout — never seen during training).
+
+![Dual-Agent Backtest](results/dual_agent_backtest.png)
+
+| | Dual-Agent | SPY (100%) |
+|---|:-:|:-:|
+| **Ann. Return** | +19.9% | +20.4% |
+| **Ann. Volatility** | 24.3% | 16.6% |
+| **Sharpe Ratio** | 0.87 | 1.21 |
+| **Max Drawdown** | −14.8% | −16.3% |
+
+**Top panel** — equity curves from a $1.00 starting NAV. Blue shading = dual-agent outperforming SPY; red shading = underperforming. The portfolio closely tracks SPY for most of the window, with a notable divergence in early 2026 driven by the Macro Governor rotating heavily into equities.
+
+**Bottom panel** — Layer 1's daily W_Equity allocation. The agent dynamically varies its equity exposure between ~40% and ~100%, cutting risk during macro stress periods (e.g. mid-2024 volatility, early 2025 drawdown) and pressing risk-on when the regime is favourable.
+
+> Returns are comparable to a 100% SPY position but achieved with a concentrated 10-stock Nasdaq selection layered on top of a dynamic TLT hedge — the portfolio is not trying to beat SPY on risk-adjusted terms; it is demonstrating that the HRL framework learns a coherent macro + micro signal.
+
 ## Setup
 
 ```bash

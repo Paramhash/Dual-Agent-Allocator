@@ -19,6 +19,6 @@ results/*
 *.parquet
 *.html
 
-# Keep the evaluation screenshot for the README
+# Keep backtest charts for the README
 *.png
-!results/evaluation.png
+!results/dual_agent_backtest.png
