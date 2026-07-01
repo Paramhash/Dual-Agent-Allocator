@@ -250,7 +250,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train/evaluate the Layer 1 Macro Governor PPO agent"
     )
-    parser.add_argument("--config",    type=str, default=None,
+    parser.add_argument("--config",    type=str, required=True,
                         help="Path to experiment config JSON (e.g. configs/aggressive_macro.json)")
     parser.add_argument("--timesteps", type=int, default=100_000)
     parser.add_argument("--n-envs",   type=int, default=4)
@@ -261,11 +261,9 @@ if __name__ == "__main__":
                         help="Skip training; only evaluate a saved policy")
     args = parser.parse_args()
 
-    config = None
-    if args.config:
-        with open(args.config) as f:
-            config = json.load(f)
-        print(f"Loaded config: {args.config}  (experiment: {config['experiment_name']})")
+    with open(args.config) as f:
+        config = json.load(f)
+    print(f"Loaded config: {args.config}  (experiment: {config['experiment_name']})")
 
     if not args.eval_only:
         train(timesteps=args.timesteps, n_envs=args.n_envs, seed=args.seed, config=config)
