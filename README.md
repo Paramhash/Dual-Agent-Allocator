@@ -152,11 +152,14 @@ python evaluate_dual_agent.py
 
 ### 4. Live inference
 
-Downloads today's market data, runs both frozen policies, and prints a trading ticket for the current month.
+Downloads today's market data, runs both frozen policies, prints a trading ticket for the current month, and saves it as a Markdown report.
 
 ```bash
-python live_inference.py
+python live_inference.py --config configs/aggressive_macro.json
+python live_inference.py --config configs/baseline_conservative.json
 ```
+
+`--config` is **required** (like `train.py`) and selects the Layer 1 persona — the policy and normaliser are resolved from the config's `experiment_name`. Layer 2 is persona-independent, so the choice only changes the equity/safe split, never the stock picks.
 
 Example output:
 
@@ -180,7 +183,11 @@ MICRO SELECTOR (Layer 2) - TOP 10 BUYS:
   CRWD
 
 =========================================
+
+Report written to: results/trading_ticket_2026-06-27_aggressive_macro.md
 ```
+
+The same ticket is written to `results/trading_ticket_{date}_{persona}.md`, so tickets for different personas on the same date don't overwrite each other.
 
 ### 5. Monitor training
 
@@ -229,6 +236,7 @@ logs/
 results/
   dual_agent_backtest.png               ← equity curve chart
   dual_agent_backtest.csv               ← monthly return ledger
+  trading_ticket_{date}_{persona}.md    ← live inference ticket report
 data/
   macro_data.parquet                    ← Layer 1 feature cache
   layer2_states.npy                     ← Layer 2 state tensor (Months × Tickers × 5)
