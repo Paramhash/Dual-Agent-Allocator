@@ -3,5 +3,5 @@
     "max_turnover": 0.10,
     "lambda_variance": 0.50,
     "lambda_drawdown": 1.00,
-    "transaction_costs": {"ES3.SI": 0.0010, "A35.SI": 0.0010, "CLR.SI": 0.0015}
+    "transaction_costs": {"SPY": 0.0010, "TLT": 0.0010}
 }
