@@ -22,9 +22,13 @@ OOS window:
     Layer 1: snapshot taken at each Layer 2 monthly boundary date
 
 Usage:
-    python evaluate_dual_agent.py
+    python evaluate_dual_agent.py --config configs/aggressive_macro.json
+    python evaluate_dual_agent.py --config configs/baseline_conservative.json
+    # Compare multiple personas on one chart:
+    python evaluate_dual_agent.py --config configs/aggressive_macro.json configs/baseline_conservative.json
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -53,12 +57,24 @@ DATA_DIR    = Path("data")
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-L1_POLICY_PATH = MODEL_DIR / "layer1_aggressive_macro_policy.zip"
-L1_NORM_PATH   = MODEL_DIR / "layer1_aggressive_macro_vec_normalise.pkl"
+# Layer 2 is persona-independent (single shared micro selector).
 L2_POLICY_PATH = MODEL_DIR / "layer2_micro_policy.zip"
 L2_NORM_PATH   = MODEL_DIR / "layer2_vec_normalise.pkl"
 
-L1_CONFIG_PATH = Path("configs") / "aggressive_macro.json"
+# Distinct colours for overlaying multiple personas on the comparison chart.
+PERSONA_COLORS = ["#1f77b4", "#2ca02c", "#e377c2", "#8c564b", "#17becf"]
+
+
+def resolve_layer1_paths(config_path):
+    """
+    Derive (policy, normaliser) paths from a Layer 1 config's experiment_name,
+    matching train.py's artifact naming: layer1_{exp_name}_{policy,vec_normalise}.
+    """
+    exp_name = json.loads(Path(config_path).read_text())["experiment_name"]
+    policy = MODEL_DIR / f"layer1_{exp_name}_policy.zip"
+    norm   = MODEL_DIR / f"layer1_{exp_name}_vec_normalise.pkl"
+    return policy, norm
+
 
 TOP_K     = 10      # number of Nasdaq stocks selected per month
 TX_COST   = 0.001   # 10 bps per month when portfolio composition changes
@@ -131,9 +147,12 @@ def load_layer2_data():
 
 # ---- 2. Model loading --------------------------------------------------------
 
-def load_layer1_model(train_data):
+def load_layer1_model(train_data, config_path, policy_path, norm_path):
     """
     Load the Layer 1 PPO policy and its VecNormalize statistics.
+
+    config_path : persona JSON (drives feature stats + reward shaping)
+    policy_path / norm_path : persona-specific artefacts (see resolve_layer1_paths)
 
     Returns (model, norm_env, feature_mean, feature_std).
 
@@ -144,7 +163,7 @@ def load_layer1_model(train_data):
     """
     print("Loading Layer 1 model...")
 
-    config = json.loads(L1_CONFIG_PATH.read_text())
+    config = json.loads(Path(config_path).read_text())
 
     # Build the env with the same training data used during training so the
     # feature_mean / feature_std match what the policy actually trained on.
@@ -156,14 +175,14 @@ def load_layer1_model(train_data):
         return Layer1MacroEnv(train_data, config=config, episode_len=252)
 
     vec_env  = DummyVecEnv([_make_env])
-    norm_env = VecNormalize.load(str(L1_NORM_PATH), vec_env)
+    norm_env = VecNormalize.load(str(norm_path), vec_env)
     norm_env.training    = False
     norm_env.norm_reward = False
 
-    model = PPO.load(str(L1_POLICY_PATH))
+    model = PPO.load(str(policy_path))
 
-    print(f"  Policy     : {L1_POLICY_PATH.name}")
-    print(f"  Normalizer : {L1_NORM_PATH.name}")
+    print(f"  Policy     : {Path(policy_path).name}")
+    print(f"  Normalizer : {Path(norm_path).name}")
     return model, norm_env, feature_mean, feature_std
 
 
@@ -495,62 +514,195 @@ def plot_results(results, save_path):
     plt.close(fig)
 
 
+def plot_comparison(results_by_persona, save_path):
+    """
+    Overlay multiple personas on a single two-panel figure.
+
+    results_by_persona : dict {persona_name: results_df}.  All personas share
+        the same SPY / NDX benchmarks and OOS dates; only port_ret and
+        w_equity differ (Layer 2 picks are persona-independent).
+      Top    : NAV curves — one line per persona + shared SPY / NDX benchmarks
+      Bottom : Layer 1 W_Equity allocation — one line per persona
+    """
+    personas = list(results_by_persona.keys())
+    first    = results_by_persona[personas[0]]
+    dates    = pd.to_datetime(first["date"])
+    spy_rets = first["spy_ret"].values
+    ndx_rets = first["ndx_ew_ret"].values
+
+    nav_dates = pd.DatetimeIndex(
+        [dates.iloc[0] - pd.DateOffset(months=1)] + list(dates)
+    )
+
+    def _nav(rets):
+        return np.concatenate([[1.0], (1 + rets).cumprod()])
+
+    spy_nav = _nav(spy_rets)
+    ndx_nav = _nav(ndx_rets)
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(14, 8),
+        gridspec_kw={"height_ratios": [2.5, 1]},
+        sharex=True,
+    )
+    fig.suptitle(
+        "Dual-Agent Hierarchical RL -- Persona Comparison (Out-of-Sample)",
+        fontsize=13, fontweight="bold", y=0.98,
+    )
+
+    # -- Top panel: NAV curves, one per persona ----------------------------
+    metric_lines = []
+    for i, name in enumerate(personas):
+        color = PERSONA_COLORS[i % len(PERSONA_COLORS)]
+        rets  = results_by_persona[name]["port_ret"].values
+        m     = _metrics(rets, f"Dual-Agent [{name}]")
+        ax1.plot(nav_dates, _nav(rets), label=name, color=color, lw=2.0, zorder=3)
+        metric_lines.append(
+            f"{name:<22} | Ann={m['ann_ret']:+.1%}  Vol={m['ann_vol']:.1%}  "
+            f"Sharpe={m['sharpe']:.2f}  MaxDD={m['max_dd']:.1%}"
+        )
+
+    m_spy = _metrics(spy_rets, "SPY Benchmark")
+    metric_lines.append(
+        f"{'SPY (100%)':<22} | Ann={m_spy['ann_ret']:+.1%}  Vol={m_spy['ann_vol']:.1%}  "
+        f"Sharpe={m_spy['sharpe']:.2f}  MaxDD={m_spy['max_dd']:.1%}"
+    )
+
+    ax1.plot(nav_dates, spy_nav, label="SPY (100%)",
+             color="#d62728", lw=1.5, linestyle="--", zorder=2)
+    ax1.plot(nav_dates, ndx_nav, label="NDX EW Universe",
+             color="#9467bd", lw=1.0, linestyle=":", alpha=0.8, zorder=1)
+
+    ax1.set_ylabel("Portfolio NAV ($1 start)", fontsize=10)
+    ax1.legend(loc="upper left", fontsize=9)
+    ax1.grid(True, alpha=0.25)
+    ax1.yaxis.set_major_formatter(mtick.FormatStrFormatter("$%.2f"))
+    ax1.annotate(
+        "\n".join(metric_lines), xy=(0.01, 0.04), xycoords="axes fraction",
+        fontsize=8, fontfamily="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="grey", alpha=0.85),
+        zorder=5,
+    )
+
+    # -- Bottom panel: W_Equity allocation, one line per persona -----------
+    for i, name in enumerate(personas):
+        color = PERSONA_COLORS[i % len(PERSONA_COLORS)]
+        ax2.plot(dates, results_by_persona[name]["w_equity"].values,
+                 label=name, color=color, lw=1.5)
+
+    ax2.set_ylabel("W_Equity", fontsize=10)
+    ax2.set_xlabel("Date", fontsize=10)
+    ax2.set_ylim(0, 1)
+    ax2.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1))
+    ax2.legend(loc="lower right", fontsize=8)
+    ax2.grid(True, alpha=0.25)
+    ax2.set_title("Layer 1 -- Macro Governor Equity Allocation", fontsize=9, pad=2)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\nComparison chart saved -> {save_path}")
+    plt.close(fig)
+
+
 # ---- 8. Entry point ----------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Dual-Agent HRL out-of-sample backtest. Pass one config for a "
+                    "single-persona chart, or several to overlay them for comparison."
+    )
+    parser.add_argument(
+        "--config", nargs="+", type=Path, required=True,
+        help="One or more Layer 1 persona configs (e.g. configs/aggressive_macro.json). "
+             "Policy/normaliser are resolved from each config's experiment_name. "
+             "Two or more configs produce a comparison chart.",
+    )
+    args = parser.parse_args()
+
     print("=" * 65)
     print("Dual-Agent Hierarchical RL -- Out-of-Sample Backtest")
     print("=" * 65)
 
-    # Validate required artefacts
-    missing = [p for p in [L1_POLICY_PATH, L1_NORM_PATH,
-                            L2_POLICY_PATH, L2_NORM_PATH]
-               if not p.exists()]
+    # Resolve + validate persona artefacts up front
+    personas = []   # list of (name, config_path, policy_path, norm_path)
+    missing  = []
+    for cfg in args.config:
+        if not cfg.exists():
+            missing.append(cfg)
+            continue
+        name = json.loads(cfg.read_text())["experiment_name"]
+        policy, norm = resolve_layer1_paths(cfg)
+        personas.append((name, cfg, policy, norm))
+        missing.extend(p for p in (policy, norm) if not p.exists())
+    missing.extend(p for p in (L2_POLICY_PATH, L2_NORM_PATH) if not p.exists())
     if missing:
         for p in missing:
             print(f"  ERROR -- missing: {p}")
         sys.exit(1)
 
-    # 1. Load data
+    # 1. Load data (shared across all personas)
     print()
     train_macro, _, full_macro = load_layer1_data()
     oos_states, oos_returns, oos_dates, tickers = load_layer2_data()
 
     N, F = oos_states.shape[1], oos_states.shape[2]
 
-    # 2. Load models
+    # 2. Load Layer 2 once (persona-independent)
     print()
-    l1_model, l1_norm, l1_mean, l1_std = load_layer1_model(train_macro)
-    l2_model, _l2_norm                 = load_layer2_model(N, F)
+    l2_model, _l2_norm = load_layer2_model(N, F)
 
-    # 3. Run backtest
-    results, top10_hist = run_backtest(
-        l1_model, l1_norm, l1_mean, l1_std,
-        l2_model,
-        oos_states, oos_returns, oos_dates,
-        tickers, full_macro,
-    )
+    # 3. Backtest each persona (only Layer 1 differs)
+    results_by_persona = {}
+    top10_by_persona   = {}
+    for name, cfg, policy, norm in personas:
+        print(f"\n----- Persona: {name} -----")
+        l1_model, l1_norm, l1_mean, l1_std = load_layer1_model(
+            train_macro, cfg, policy, norm
+        )
+        results, top10_hist = run_backtest(
+            l1_model, l1_norm, l1_mean, l1_std,
+            l2_model,
+            oos_states, oos_returns, oos_dates,
+            tickers, full_macro,
+        )
+        results_by_persona[name] = results
+        top10_by_persona[name]   = top10_hist
 
     # 4. Performance summary
     print("\n" + "=" * 65)
     print("Performance Summary")
     print("=" * 65)
-    _metrics(results["port_ret"].values,   "Dual-Agent Portfolio")
-    _metrics(results["spy_ret"].values,    "SPY Benchmark")
-    _metrics(results["ndx_ew_ret"].values, "NDX Equal-Weight Benchmark")
+    for name, results in results_by_persona.items():
+        _metrics(results["port_ret"].values, f"Dual-Agent [{name}]")
+    first = next(iter(results_by_persona.values()))
+    _metrics(first["spy_ret"].values,    "SPY Benchmark")
+    _metrics(first["ndx_ew_ret"].values, "NDX Equal-Weight Benchmark")
 
-    # 5. Top-10 snapshot (last OOS month)
+    # 5. Top-10 snapshot (last OOS month; identical across personas)
+    any_top10 = next(iter(top10_by_persona.values()))
     print(f"\nTop-10 selection (last OOS month, {oos_dates[-2].date()}):")
-    print("  " + ", ".join(top10_hist[-1]))
+    print("  " + ", ".join(any_top10[-1]))
 
     # 6. Save outputs
-    csv_path  = RESULTS_DIR / "dual_agent_backtest.csv"
-    plot_path = RESULTS_DIR / "dual_agent_backtest.png"
+    if len(results_by_persona) == 1:
+        name, results = next(iter(results_by_persona.items()))
+        csv_path  = RESULTS_DIR / "dual_agent_backtest.csv"
+        plot_path = RESULTS_DIR / "dual_agent_backtest.png"
+        results.to_csv(csv_path, index=False)
+        print(f"\nMonthly results saved -> {csv_path}")
+        plot_results(results, plot_path)
+    else:
+        # Combined CSV (persona column) + overlaid comparison chart
+        combined = pd.concat(
+            [r.assign(persona=name) for name, r in results_by_persona.items()],
+            ignore_index=True,
+        )
+        csv_path  = RESULTS_DIR / "dual_agent_comparison.csv"
+        plot_path = RESULTS_DIR / "dual_agent_comparison.png"
+        combined.to_csv(csv_path, index=False)
+        print(f"\nMonthly results saved -> {csv_path}")
+        plot_comparison(results_by_persona, plot_path)
 
-    results.to_csv(csv_path, index=False)
-    print(f"\nMonthly results saved -> {csv_path}")
-
-    plot_results(results, plot_path)
     print("\nDone.")
 
 

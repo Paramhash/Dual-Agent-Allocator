@@ -20,6 +20,7 @@ results/*
 *.parquet
 *.html
 
-# Keep backtest charts for the README
+# Keep the persona-comparison chart + ledger for the README
 *.png
-!results/dual_agent_backtest.png
+!results/dual_agent_comparison.png
+!results/dual_agent_comparison.csv
