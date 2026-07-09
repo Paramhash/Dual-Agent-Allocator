@@ -161,39 +161,43 @@ python evaluate_dual_agent.py --config configs/aggressive_macro.json configs/bas
 Downloads today's market data, runs both frozen policies, prints a trading ticket for the current month, and saves it as a Markdown report.
 
 ```bash
+# Single persona
 python live_inference.py --config configs/aggressive_macro.json
 python live_inference.py --config configs/baseline_conservative.json
+
+# Compare personas in one run
+python live_inference.py --config configs/aggressive_macro.json configs/baseline_conservative.json
 ```
 
-`--config` is **required** (like `train.py`) and selects the Layer 1 persona — the policy and normaliser are resolved from the config's `experiment_name`. Layer 2 is persona-independent, so the choice only changes the equity/safe split, never the stock picks.
+`--config` is **required** (like `train.py`) and selects the Layer 1 persona — the policy and normaliser are resolved from the config's `experiment_name`. Layer 2 is persona-independent, so the persona choice only changes the equity/safe budget, never the stock picks. Passing two or more configs downloads the live data and runs the stock selection **once**, then reports each persona's macro budget against the shared Top-10.
 
-Example output:
+Example output (comparison mode):
 
 ```text
 =========================================
-LIVE DUAL-AGENT INFERENCE (Date: 2026-06-27)
+LIVE DUAL-AGENT INFERENCE (Date: 2026-07-08)
 
-MACRO GOVERNOR (Layer 1):
+MACRO GOVERNOR (Layer 1) - EQUITY / SAFE BUDGET:
 
-  Target Equity Weight : 72.4%
+  aggressive_macro         Equity 13.8%   Safe 86.2% (TLT / Cash)
+  baseline_conservative    Equity 55.2%   Safe 44.8% (TLT / Cash)
 
-  Target Safe Weight   : 27.6% (TLT / Cash)
+MICRO SELECTOR (Layer 2) - TOP 10 BUYS (shared):
 
-MICRO SELECTOR (Layer 2) - TOP 10 BUYS:
-
-  NVDA
-
-  MSFT
+  IDXX
+  DXCM
   ...
-
-  CRWD
+  INTU
 
 =========================================
 
-Report written to: results/trading_ticket_2026-06-27_aggressive_macro.md
+Report written to: results/trading_ticket_2026-07-08_comparison.md
 ```
 
-The same ticket is written to `results/trading_ticket_{date}_{persona}.md`, so tickets for different personas on the same date don't overwrite each other.
+Reports are written to `results/`:
+
+- Single persona → `trading_ticket_{date}_{persona}.md` (persona in the filename so same-date tickets don't overwrite each other).
+- Multiple personas → `trading_ticket_{date}_comparison.md`.
 
 ### 5. Monitor training
 
@@ -244,7 +248,8 @@ results/
   dual_agent_backtest.csv               ← single-persona monthly ledger
   dual_agent_comparison.png             ← multi-persona comparison chart
   dual_agent_comparison.csv             ← multi-persona monthly ledger
-  trading_ticket_{date}_{persona}.md    ← live inference ticket report
+  trading_ticket_{date}_{persona}.md    ← live inference ticket (single persona)
+  trading_ticket_{date}_comparison.md   ← live inference ticket (multi-persona)
 data/
   macro_data.parquet                    ← Layer 1 feature cache
   layer2_states.npy                     ← Layer 2 state tensor (Months × Tickers × 5)

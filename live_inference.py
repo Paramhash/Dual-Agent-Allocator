@@ -7,6 +7,8 @@ Downloads live market data, runs both agents, and prints a terminal
 Usage:
     python live_inference.py --config configs/aggressive_macro.json
     python live_inference.py --config configs/baseline_conservative.json
+    # Compare personas side by side (shared stock picks, differing macro budget):
+    python live_inference.py --config configs/aggressive_macro.json configs/baseline_conservative.json
 
 Prerequisites:
     - python data_loader.py       (produces data/macro_data.parquet — needed for
@@ -45,17 +47,7 @@ except ImportError:
 
 MODEL_DIR   = Path("models")
 DATA_DIR    = Path("data")
-CONFIG_DIR  = Path("configs")
 RESULTS_DIR = Path("results")
-
-DEFAULT_L1_CONFIG = CONFIG_DIR / "aggressive_macro.json"
-
-# Layer 1 paths are persona-specific and resolved from the chosen config's
-# experiment_name (see resolve_layer1_paths / --config).  These module-level
-# values are the defaults; main() overwrites them based on the CLI argument.
-L1_CONFIG_PATH = DEFAULT_L1_CONFIG
-L1_POLICY_PATH = MODEL_DIR / "layer1_aggressive_macro_policy.zip"
-L1_NORM_PATH   = MODEL_DIR / "layer1_aggressive_macro_vec_normalise.pkl"
 
 # Layer 2 is persona-independent (single micro selector).
 L2_POLICY_PATH = MODEL_DIR / "layer2_micro_policy.zip"
@@ -67,7 +59,7 @@ def resolve_layer1_paths(config_path: Path) -> tuple[Path, Path]:
     Derive (policy, normaliser) paths from a Layer 1 config's experiment_name,
     matching train.py's artifact naming: layer1_{exp_name}_{policy,vec_normalise}.
     """
-    exp_name = json.loads(config_path.read_text())["experiment_name"]
+    exp_name = json.loads(Path(config_path).read_text())["experiment_name"]
     policy = MODEL_DIR / f"layer1_{exp_name}_policy.zip"
     norm   = MODEL_DIR / f"layer1_{exp_name}_vec_normalise.pkl"
     return policy, norm
@@ -311,9 +303,12 @@ def get_live_micro_state(tickers: list[str]) -> np.ndarray:
 
 # ── 3. Model loading ──────────────────────────────────────────────────────────
 
-def load_layer1_model():
+def load_layer1_model(config_path, policy_path, norm_path):
     """
     Load Layer 1 PPO policy and its frozen VecNormalize.
+
+    config_path : persona JSON (drives feature stats + reward shaping)
+    policy_path / norm_path : persona-specific artefacts (see resolve_layer1_paths)
 
     Replicates evaluate_dual_agent.py::load_layer1_model exactly:
       1. Load cached macro parquet to reconstruct training-period feature stats
@@ -328,7 +323,7 @@ def load_layer1_model():
             "Run: python data_loader.py  to build the macro cache."
         )
 
-    config  = json.loads(L1_CONFIG_PATH.read_text())
+    config  = json.loads(Path(config_path).read_text())
     stored  = pd.read_parquet(MACRO_CACHE)
 
     prices   = stored[["SPY", "TLT"]]
@@ -354,11 +349,11 @@ def load_layer1_model():
         return Layer1MacroEnv(train_data, config=config, episode_len=252)
 
     vec_env  = DummyVecEnv([_make_env])
-    norm_env = VecNormalize.load(str(L1_NORM_PATH), vec_env)
+    norm_env = VecNormalize.load(str(norm_path), vec_env)
     norm_env.training    = False
     norm_env.norm_reward = False
 
-    model = PPO.load(str(L1_POLICY_PATH))
+    model = PPO.load(str(policy_path))
     return model, norm_env, feature_mean, feature_std
 
 
@@ -428,33 +423,35 @@ def predict_layer2(model: PPO, state: np.ndarray, k: int = TOP_K) -> list[int]:
 
 # ── 5. Report output ────────────────────────────────────────────────────────
 
+def _picks_table(top_tickers: list[str]) -> str:
+    """Markdown table body for the Top-N picks (shared by both report writers)."""
+    return "\n".join(
+        f"| {rank} | {ticker} |" for rank, ticker in enumerate(top_tickers, start=1)
+    )
+
+
 def write_trading_ticket_report(
     inference_date: str,
+    persona_name: str,
+    l1_policy_name: str,
     w_equity: float,
     w_safe: float,
     top_tickers: list[str],
 ) -> Path:
     """
-    Persist the Trading Ticket (macro budget split + top-10 picks) as a
-    Markdown report in results/.  Returns the path written.
+    Persist a single-persona Trading Ticket (macro budget split + top-10 picks)
+    as a Markdown report in results/.  Returns the path written.
 
-    File is named results/trading_ticket_{inference_date}.md so each run
-    produces a dated, self-contained record of the live signal.
+    File is named results/trading_ticket_{date}_{persona}.md so tickets for
+    different personas on the same date do not overwrite each other.
     """
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    # Include the Layer 1 persona so tickets for different personas on the same
-    # date do not overwrite each other.
-    exp_name = json.loads(L1_CONFIG_PATH.read_text())["experiment_name"]
-    out_path = RESULTS_DIR / f"trading_ticket_{inference_date}_{exp_name}.md"
-
-    picks_table = "\n".join(
-        f"| {rank} | {ticker} |" for rank, ticker in enumerate(top_tickers, start=1)
-    )
+    out_path = RESULTS_DIR / f"trading_ticket_{inference_date}_{persona_name}.md"
 
     report = f"""# Dual-Agent Trading Ticket
 
 **Date:** {inference_date}
-**Layer 1 policy:** `{L1_POLICY_PATH.name}`
+**Layer 1 policy:** `{l1_policy_name}`
 **Layer 2 policy:** `{L2_POLICY_PATH.name}`
 
 ---
@@ -474,7 +471,64 @@ def write_trading_ticket_report(
 
 | Rank | Ticker |
 |-----:|--------|
-{picks_table}
+{_picks_table(top_tickers)}
+
+---
+
+*Generated by `live_inference.py`. Signal is as-of the most recent completed
+trading day of the macro feature set.*
+"""
+
+    out_path.write_text(report)
+    return out_path
+
+
+def write_comparison_ticket_report(
+    inference_date: str,
+    persona_rows: list[tuple[str, float, float]],
+    top_tickers: list[str],
+) -> Path:
+    """
+    Persist a multi-persona comparison Trading Ticket as a Markdown report.
+
+    persona_rows : list of (persona_name, w_equity, w_safe).  The Top-N picks
+        are shared across personas (Layer 2 is persona-independent); only the
+        Layer 1 equity/safe budget differs.
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS_DIR / f"trading_ticket_{inference_date}_comparison.md"
+
+    macro_rows = "\n".join(
+        f"| `{name}` | {w_eq:.1%} | {w_sf:.1%} |"
+        for name, w_eq, w_sf in persona_rows
+    )
+
+    report = f"""# Dual-Agent Trading Ticket — Persona Comparison
+
+**Date:** {inference_date}
+**Layer 2 policy:** `{L2_POLICY_PATH.name}`
+
+---
+
+## Macro Governor (Layer 1) — Budget by Persona
+
+Only the equity/safe split differs between personas; the stock picks below
+are shared (Layer 2 is persona-independent).
+
+| Persona | Equity | Safe Harbor (TLT / Cash) |
+|---------|-------:|-------------------------:|
+{macro_rows}
+
+---
+
+## Micro Selector (Layer 2) — Top {len(top_tickers)} Buys (shared)
+
+Within each persona's equity sleeve, capital is allocated across these names
+(highest-scored first).
+
+| Rank | Ticker |
+|-----:|--------|
+{_picks_table(top_tickers)}
 
 ---
 
@@ -490,37 +544,43 @@ trading day of the macro feature set.*
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Dual-Agent HRL live inference — prints and saves a Trading Ticket."
+        description="Dual-Agent HRL live inference — prints and saves a Trading "
+                    "Ticket. Pass one config for a single-persona ticket, or "
+                    "several to compare their macro budgets side by side."
     )
     parser.add_argument(
         "--config",
+        nargs="+",
         type=Path,
         required=True,
-        help="Layer 1 persona config (e.g. configs/aggressive_macro.json). "
-             "The policy/normaliser are resolved from its experiment_name. "
-             "Required — matches train.py to prevent running the wrong persona.",
+        help="One or more Layer 1 persona configs (e.g. configs/aggressive_macro.json). "
+             "The policy/normaliser are resolved from each config's experiment_name. "
+             "Two or more configs produce a comparison ticket.",
     )
     args = parser.parse_args()
 
-    if not args.config.exists():
-        print(f"\nERROR — config not found: {args.config}")
-        sys.exit(1)
-
-    # Resolve persona-specific Layer 1 artefacts from the chosen config.
-    global L1_CONFIG_PATH, L1_POLICY_PATH, L1_NORM_PATH
-    L1_CONFIG_PATH = args.config
-    L1_POLICY_PATH, L1_NORM_PATH = resolve_layer1_paths(L1_CONFIG_PATH)
-
-    # Validate required artefacts up front
-    required = {
-        L1_POLICY_PATH: "Layer 1 policy    (train: python train.py --config configs/aggressive_macro.json)",
-        L1_NORM_PATH:   "Layer 1 normaliser (train: python train.py --config configs/aggressive_macro.json)",
+    # Resolve + validate persona artefacts up front
+    personas = []   # list of (name, config_path, policy_path, norm_path)
+    missing  = []
+    for cfg in args.config:
+        if not cfg.exists():
+            print(f"\nERROR — config not found: {cfg}")
+            sys.exit(1)
+        name = json.loads(cfg.read_text())["experiment_name"]
+        policy, norm = resolve_layer1_paths(cfg)
+        personas.append((name, cfg, policy, norm))
+        missing.extend(
+            (str(p), f"Layer 1 artefact for '{name}' "
+                     f"(train: python train.py --config {cfg})")
+            for p in (policy, norm) if not p.exists()
+        )
+    shared_required = {
         L2_POLICY_PATH: "Layer 2 policy    (train: python train_layer2.py)",
         L2_NORM_PATH:   "Layer 2 normaliser (train: python train_layer2.py)",
         MACRO_CACHE:    "Macro data cache   (run:   python data_loader.py)",
         L2_META_FILE:   "Layer 2 meta       (run:   python data_loader_layer2.py)",
     }
-    missing = [(str(p), hint) for p, hint in required.items() if not p.exists()]
+    missing.extend((str(p), hint) for p, hint in shared_required.items() if not p.exists())
     if missing:
         print("\nERROR — missing required files:")
         for path, hint in missing:
@@ -533,52 +593,63 @@ def main():
     print("  DUAL-AGENT LIVE INFERENCE")
     print("=" * 45)
 
-    # ── Step 1: live macro features (Layer 1) ──────────────────────────────
+    # ── Step 1: live macro features (shared download) ──────────────────────
     print("\n[1/4] Downloading live macro data…")
     live_macro, inference_date = get_live_macro_features()
     print(f"  Live feature date: {inference_date}")
 
-    # ── Step 2: live micro features (Layer 2) ──────────────────────────────
+    # ── Step 2: live micro features (shared download) ──────────────────────
     print("\n[2/4] Downloading live micro data…")
     tickers       = _get_training_tickers()
     live_micro    = get_live_micro_state(tickers)
     print(f"  Live feature matrix: {live_micro.shape}  (N_Tickers × 5)")
 
-    # ── Step 3: load models ────────────────────────────────────────────────
-    print("\n[3/4] Loading models…")
-    l1_model, l1_norm, l1_mean, l1_std = load_layer1_model()
-    print(f"  Layer 1 policy    : {L1_POLICY_PATH.name}")
-    print(f"  Layer 1 normaliser: {L1_NORM_PATH.name}")
-    l2_model = load_layer2_model()
+    # ── Step 3: Layer 2 once (persona-independent picks) ───────────────────
+    print("\n[3/4] Loading Layer 2 + selecting stocks…")
+    l2_model    = load_layer2_model()
+    top_k_idx   = predict_layer2(l2_model, live_micro)
+    top_tickers = [tickers[i] for i in top_k_idx]   # highest-scored first
     print(f"  Layer 2 policy    : {L2_POLICY_PATH.name}")
 
-    # ── Step 4: run inference ──────────────────────────────────────────────
-    print("\n[4/4] Running dual-agent inference…")
-    w_equity, w_safe = predict_layer1(l1_model, l1_norm, l1_mean, l1_std, live_macro)
-    top_k_idx        = predict_layer2(l2_model, live_micro)
-    top_tickers      = [tickers[i] for i in top_k_idx]   # highest-scored first
+    # ── Step 4: Layer 1 per persona (macro budget) ─────────────────────────
+    print("\n[4/4] Running Layer 1 macro budget per persona…")
+    persona_rows = []   # (name, w_equity, w_safe)
+    for name, cfg, policy, norm in personas:
+        l1_model, l1_norm, l1_mean, l1_std = load_layer1_model(cfg, policy, norm)
+        w_equity, w_safe = predict_layer1(
+            l1_model, l1_norm, l1_mean, l1_std, live_macro
+        )
+        persona_rows.append((name, w_equity, w_safe))
+        print(f"  {name:<24} Equity {w_equity:.1%}  Safe {w_safe:.1%}")
 
     # ── Trading Ticket ─────────────────────────────────────────────────────
     print()
     print("=========================================")
     print(f"LIVE DUAL-AGENT INFERENCE (Date: {inference_date})")
     print()
-    print("MACRO GOVERNOR (Layer 1):")
+    print("MACRO GOVERNOR (Layer 1) - EQUITY / SAFE BUDGET:")
     print()
-    print(f"  Target Equity Weight : {w_equity:.1%}")
-    print(f"  Target Safe Weight   : {w_safe:.1%} (TLT / Cash)")
+    for name, w_equity, w_safe in persona_rows:
+        print(f"  {name:<24} Equity {w_equity:.1%}   Safe {w_safe:.1%} (TLT / Cash)")
     print()
-    print("MICRO SELECTOR (Layer 2) - TOP 10 BUYS:")
+    print("MICRO SELECTOR (Layer 2) - TOP 10 BUYS (shared):")
     print()
     for ticker in top_tickers:
         print(f"  {ticker}")
-        print()
+    print()
     print("=========================================")
 
     # ── Persist ticket as a Markdown report ────────────────────────────────
-    report_path = write_trading_ticket_report(
-        inference_date, w_equity, w_safe, top_tickers
-    )
+    if len(personas) == 1:
+        name, _cfg, policy, _norm = personas[0]
+        _, w_equity, w_safe = persona_rows[0]
+        report_path = write_trading_ticket_report(
+            inference_date, name, policy.name, w_equity, w_safe, top_tickers
+        )
+    else:
+        report_path = write_comparison_ticket_report(
+            inference_date, persona_rows, top_tickers
+        )
     print(f"\nReport written to: {report_path}")
 
 
