@@ -423,11 +423,36 @@ def predict_layer2(model: PPO, state: np.ndarray, k: int = TOP_K) -> list[int]:
 
 # ── 5. Report output ────────────────────────────────────────────────────────
 
-def _picks_table(top_tickers: list[str]) -> str:
-    """Markdown table body for the Top-N picks (shared by both report writers)."""
-    return "\n".join(
-        f"| {rank} | {ticker} |" for rank, ticker in enumerate(top_tickers, start=1)
-    )
+def _md_table(headers: list[str], rows: list[list[str]], aligns: list[str]) -> str:
+    """
+    Render a GitHub-flavoured Markdown table with every pipe column-aligned
+    (markdownlint MD060 "aligned" style).  aligns entries are 'l' or 'r'.
+    """
+    n = len(headers)
+    widths = [len(headers[c]) for c in range(n)]
+    for row in rows:
+        for c in range(n):
+            widths[c] = max(widths[c], len(row[c]))
+    widths = [max(w, 3) for w in widths]   # room for the '---' separator
+
+    def _cell(text: str, c: str, w: int) -> str:
+        return text.rjust(w) if c == "r" else text.ljust(w)
+
+    def _sep(c: str, w: int) -> str:
+        return "-" * (w - 1) + ":" if c == "r" else ":" + "-" * (w - 1)
+
+    def _line(cells: list[str]) -> str:
+        return "| " + " | ".join(cells) + " |"
+
+    lines = [
+        _line([_cell(headers[c], aligns[c], widths[c]) for c in range(n)]),
+        _line([_sep(aligns[c], widths[c]) for c in range(n)]),
+    ]
+    lines += [
+        _line([_cell(row[c], aligns[c], widths[c]) for c in range(n)])
+        for row in rows
+    ]
+    return "\n".join(lines)
 
 
 def write_trading_ticket_report(
@@ -448,6 +473,18 @@ def write_trading_ticket_report(
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / f"trading_ticket_{inference_date}_{persona_name}.md"
 
+    macro_table = _md_table(
+        ["Sleeve", "Target Weight"],
+        [["Equity", f"{w_equity:.1%}"],
+         ["Safe Harbor (TLT / Cash)", f"{w_safe:.1%}"]],
+        ["l", "r"],
+    )
+    picks_table = _md_table(
+        ["Rank", "Ticker"],
+        [[str(rank), ticker] for rank, ticker in enumerate(top_tickers, start=1)],
+        ["r", "l"],
+    )
+
     report = f"""# Dual-Agent Trading Ticket
 
 **Date:** {inference_date}
@@ -458,10 +495,7 @@ def write_trading_ticket_report(
 
 ## Macro Governor (Layer 1)
 
-| Sleeve | Target Weight |
-|--------|--------------:|
-| Equity | {w_equity:.1%} |
-| Safe Harbor (TLT / Cash) | {w_safe:.1%} |
+{macro_table}
 
 ---
 
@@ -469,9 +503,7 @@ def write_trading_ticket_report(
 
 100% of the equity sleeve is allocated across these names (highest-scored first).
 
-| Rank | Ticker |
-|-----:|--------|
-{_picks_table(top_tickers)}
+{picks_table}
 
 ---
 
@@ -498,9 +530,16 @@ def write_comparison_ticket_report(
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / f"trading_ticket_{inference_date}_comparison.md"
 
-    macro_rows = "\n".join(
-        f"| `{name}` | {w_eq:.1%} | {w_sf:.1%} |"
-        for name, w_eq, w_sf in persona_rows
+    macro_table = _md_table(
+        ["Persona", "Equity", "Safe Harbor (TLT / Cash)"],
+        [[f"`{name}`", f"{w_eq:.1%}", f"{w_sf:.1%}"]
+         for name, w_eq, w_sf in persona_rows],
+        ["l", "r", "r"],
+    )
+    picks_table = _md_table(
+        ["Rank", "Ticker"],
+        [[str(rank), ticker] for rank, ticker in enumerate(top_tickers, start=1)],
+        ["r", "l"],
     )
 
     report = f"""# Dual-Agent Trading Ticket — Persona Comparison
@@ -515,9 +554,7 @@ def write_comparison_ticket_report(
 Only the equity/safe split differs between personas; the stock picks below
 are shared (Layer 2 is persona-independent).
 
-| Persona | Equity | Safe Harbor (TLT / Cash) |
-|---------|-------:|-------------------------:|
-{macro_rows}
+{macro_table}
 
 ---
 
@@ -526,9 +563,7 @@ are shared (Layer 2 is persona-independent).
 Within each persona's equity sleeve, capital is allocated across these names
 (highest-scored first).
 
-| Rank | Ticker |
-|-----:|--------|
-{_picks_table(top_tickers)}
+{picks_table}
 
 ---
 
