@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+source/
 
 # Generated artifacts — not committed; reproduce locally
 data/
