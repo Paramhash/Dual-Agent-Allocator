@@ -46,14 +46,21 @@ class Layer2MicroEnv(gym.Env):
     test_fraction : float
         Fraction of months reserved for the test set.
 
-    Observation space — Box(shape=(N_Tickers, 5), low=-10, high=10, float32)
-    -------------------------------------------------------------------------
+    Observation space — Box(shape=(N_Tickers, 10), low=-10, high=10, float32)
+    --------------------------------------------------------------------------
     Cross-sectionally z-scored feature matrix for the current month:
+      MOMENTUM SIGNALS (5 features):
         [:, 0]  Mom_90       — 90-day price momentum
         [:, 1]  Stretch      — distance from 50-day SMA
         [:, 2]  Downside_Var — 30-day downside volatility
         [:, 3]  CMF          — 20-day Chaikin Money Flow
         [:, 4]  StochRSI     — 14-day Stochastic RSI k-line
+      FACTOR ROTATION SIGNALS (5 features):
+        [:, 5]  Mom_6m       — 6-month price momentum (trend)
+        [:, 6]  Vol_60d      — 60-day realized volatility (quality)
+        [:, 7]  Beta_NDX     — rolling beta to Nasdaq 100 (risk)
+        [:, 8]  RelStr_NDX   — relative strength vs NDX (rotation)
+        [:, 9]  MeanRev      — distance from 200-day SMA (valuation)
     Stocks with missing history are represented by a zero row (neutral signal).
 
     Action space — Box(shape=(N_Tickers,), low=-1, high=1, float32)

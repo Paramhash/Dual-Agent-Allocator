@@ -1,24 +1,28 @@
 """
-data_loader_layer2.py — Layer 2 (Micro Selector) data pipeline.
+data_loader_layer2.py — Layer 2 (Micro Selector) data pipeline with Factor Rotation.
 
-Downloads OHLCV for the Nasdaq 100 universe, computes 5 cross-sectional
-features per stock per day, applies cross-sectional z-scoring, samples
-monthly, and writes:
+Downloads OHLCV for the Nasdaq 100 universe, computes 10 cross-sectional
+features per stock per day (5 momentum + 5 factor rotation), applies cross-sectional
+z-scoring, samples monthly, and writes:
 
-    data/layer2_states.npy    — float32, shape (Total_Months, N_Tickers, 5)
+    data/layer2_states.npy    — float32, shape (Total_Months, N_Tickers, 10)
     data/layer2_returns.npy   — float32, shape (Total_Months, N_Tickers)
     data/layer2_meta.json     — ordered ticker list + monthly date strings
 
-Stocks that pre-date the window or had data issues produce NaN features
-that are filled with 0 after z-scoring — they contribute a neutral signal
-and receive a 0-forward-return, so they never break the tensor shape.
-
-Features (5-dim per stock):
+Features (10-dim per stock):
+  MOMENTUM SIGNALS:
     Mom_90       — 90-day price return
     Stretch      — (Close − SMA50) / SMA50
     Downside_Var — 30-day rolling std of negative-only daily returns
-    CMF          — 20-day Chaikin Money Flow  (via pandas-ta)
-    StochRSI     — 14-day Stochastic RSI k-line (via pandas-ta)
+    CMF          — 20-day Chaikin Money Flow
+    StochRSI     — 14-day Stochastic RSI k-line
+
+  FACTOR ROTATION SIGNALS:
+    Mom_6m       — 6-month price return (long-term trend)
+    Vol_60d      — 60-day realized volatility (quality signal)
+    Beta_NDX     — Rolling beta to Nasdaq 100 (systematic risk)
+    RelStr_NDX   — Relative strength vs NDX (factor rotation)
+    MeanRev      — Extended from SMA200 (valuation extreme)
 """
 
 import json
@@ -64,7 +68,10 @@ UNIVERSE = [
     "TTD", "ABNB",
 ]
 
-FEATURE_NAMES = ["Mom_90", "Stretch", "Downside_Var", "CMF", "StochRSI"]
+FEATURE_NAMES = [
+    "Mom_90", "Stretch", "Downside_Var", "CMF", "StochRSI",  # Momentum
+    "Mom_6m", "Vol_60d", "Beta_NDX", "RelStr_NDX", "MeanRev",  # Factor rotation
+]
 
 HISTORY_YEARS  = 15
 MONTHLY_STEP   = 21    # trading days per month sample
@@ -190,6 +197,59 @@ def _stochrsi(close: pd.DataFrame,
     return stochrsi.fillna(0.0)
 
 
+def _mom6m(close: pd.DataFrame) -> pd.DataFrame:
+    """6-month price return (factor rotation: long-term trend)."""
+    return close.pct_change(126)  # ~6 months of trading days
+
+
+def _vol60d(close: pd.DataFrame) -> pd.DataFrame:
+    """60-day realized volatility (quality/stability signal)."""
+    ret = close.pct_change()
+    return ret.rolling(60, min_periods=20).std().fillna(0.0)
+
+
+def _beta_to_ndx(close: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rolling 60-day beta to Nasdaq 100 (systematic risk).
+    Beta = Cov(stock, NDX) / Var(NDX)
+    """
+    # Compute equal-weight NDX returns
+    ndx_ret = close.pct_change().mean(axis=1)
+
+    betas = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+    for ticker in close.columns:
+        stock_ret = close[ticker].pct_change()
+        cov = stock_ret.rolling(60, min_periods=20).cov(ndx_ret)
+        var_ndx = ndx_ret.rolling(60, min_periods=20).var()
+        betas[ticker] = cov / var_ndx.replace(0.0, np.nan)
+
+    return betas.fillna(1.0)  # Default beta = 1.0 if insufficient data
+
+
+def _rel_strength_ndx(close: pd.DataFrame) -> pd.DataFrame:
+    """
+    Relative strength vs NDX (30-day rolling).
+    RelStr = Stock 30-day return - NDX 30-day return
+    """
+    stock_30d_ret = close.pct_change(30)
+    ndx_30d_ret = close.pct_change(30).mean(axis=1)  # EW NDX return
+
+    relstr = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+    for ticker in close.columns:
+        relstr[ticker] = stock_30d_ret[ticker] - ndx_30d_ret
+
+    return relstr.fillna(0.0)
+
+
+def _mean_reversion(close: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mean reversion signal: how extended stock is from SMA200 (valuation).
+    Positive = stretched above 200-SMA (overvalued, mean reversion likely).
+    """
+    sma200 = close.rolling(200, min_periods=50).mean()
+    return ((close - sma200) / sma200).fillna(0.0)
+
+
 def _cs_zscore(panel: pd.DataFrame) -> pd.DataFrame:
     """
     Cross-sectional z-score: for each date, normalise values across all tickers.
@@ -210,7 +270,7 @@ def build_dataset(force_refresh: bool = False) -> tuple[np.ndarray, np.ndarray, 
 
     Returns
     -------
-    states   : ndarray (Total_Months, N_Tickers, 5)  float32
+    states   : ndarray (Total_Months, N_Tickers, 10)  float32  [5 momentum + 5 factor rotation]
     returns  : ndarray (Total_Months, N_Tickers)      float32
     tickers  : list of str  (ordered, length N_Tickers)
     dates    : list of str  (ISO dates of each monthly sample)
@@ -221,6 +281,7 @@ def build_dataset(force_refresh: bool = False) -> tuple[np.ndarray, np.ndarray, 
         returns = np.load(RETURNS_FILE)
         meta    = json.loads(META_FILE.read_text())
         print(f"  States : {states.shape}   Returns: {returns.shape}")
+        print(f"  Features: {meta['features']}")
         return states, returns, meta["tickers"], meta["dates"]
 
     CACHE_DIR.mkdir(exist_ok=True)
@@ -233,7 +294,8 @@ def build_dataset(force_refresh: bool = False) -> tuple[np.ndarray, np.ndarray, 
 
     print(f"\nComputing features for {N} tickers over {T} trading days...")
 
-    # ── 2. Feature engineering (all vectorised except CMF/StochRSI) ───────
+    # ── 2. Feature engineering ────────────────────────────────────────────
+    # Momentum signals
     mom90_raw       = _mom90(close)
     stretch_raw     = _stretch(close)
     downside_var_raw= _downside_var(close)
@@ -244,6 +306,22 @@ def build_dataset(force_refresh: bool = False) -> tuple[np.ndarray, np.ndarray, 
     print("  Computing StochRSI...")
     stochrsi_raw = _stochrsi(close)
 
+    # Factor rotation signals
+    print("  Computing 6-month momentum...")
+    mom6m_raw = _mom6m(close)
+
+    print("  Computing 60-day volatility...")
+    vol60d_raw = _vol60d(close)
+
+    print("  Computing beta to NDX...")
+    beta_raw = _beta_to_ndx(close)
+
+    print("  Computing relative strength...")
+    relstr_raw = _rel_strength_ndx(close)
+
+    print("  Computing mean reversion...")
+    meanrev_raw = _mean_reversion(close)
+
     # ── 3. Cross-sectional z-score ────────────────────────────────────────
     print("  Applying cross-sectional z-scoring...")
     panels = [
@@ -252,14 +330,19 @@ def build_dataset(force_refresh: bool = False) -> tuple[np.ndarray, np.ndarray, 
         _cs_zscore(downside_var_raw),
         _cs_zscore(cmf_raw),
         _cs_zscore(stochrsi_raw),
+        _cs_zscore(mom6m_raw),
+        _cs_zscore(vol60d_raw),
+        _cs_zscore(beta_raw),
+        _cs_zscore(relstr_raw),
+        _cs_zscore(meanrev_raw),
     ]
 
-    # ── 4. Build 3D tensor (T, N, 5) then sample monthly ─────────────────
-    # Stack into (T, N, 5)
+    # ── 4. Build 3D tensor (T, N, 10) then sample monthly ─────────────────
+    # Stack into (T, N, 10)
     all_features = np.stack(
         [p.reindex(columns=tickers).values for p in panels],
         axis=-1,
-    ).astype(np.float32)   # (T, N, 5)
+    ).astype(np.float32)   # (T, N, 10)
 
     # Monthly sample indices: 0, 21, 42, ... but only where forward return exists
     monthly_idx = list(range(0, T - MONTHLY_STEP, MONTHLY_STEP))
@@ -319,10 +402,11 @@ if __name__ == "__main__":
     print(f"Returns matrix: {returns.shape}")
 
     print(f"\nFeature sample (last month, first 5 tickers):")
+    print(f"  {'Ticker':<8} | Momentum Signals (5) | Factor Rotation Signals (5)")
     for i, t in enumerate(tickers[:5]):
-        print(f"  {t:8s}  " + "  ".join(
-            f"{FEATURE_NAMES[f]}={states[-1, i, f]:+.3f}" for f in range(5)
-        ))
+        momentum = "  ".join(f"{FEATURE_NAMES[f]}={states[-1, i, f]:+.3f}" for f in range(5))
+        factors = "  ".join(f"{FEATURE_NAMES[f]}={states[-1, i, f]:+.3f}" for f in range(5, 10))
+        print(f"  {t:<8} | {momentum} | {factors}")
 
     print(f"\nForward return sample (last month, first 5 tickers):")
     for i, t in enumerate(tickers[:5]):

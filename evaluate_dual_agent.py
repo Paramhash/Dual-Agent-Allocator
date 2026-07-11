@@ -419,6 +419,29 @@ def _metrics(rets, label):
     return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe, "max_dd": max_dd}
 
 
+# ---- 6b. Save top-10 history --------------------------------------------------
+
+def save_top10_history(top10_hist, oos_dates, save_path):
+    """
+    Save the monthly top-10 stock selections as a CSV.
+
+    top10_hist : list of lists, length M_oos-1; each inner list has 10 ticker strings
+    oos_dates  : DatetimeIndex; sample dates for the OOS window
+    save_path  : Path to write CSV
+    """
+    dates = [str(oos_dates[i].date()) for i in range(len(top10_hist))]
+    rows = []
+    for date, picks in zip(dates, top10_hist):
+        row = {"date": date}
+        for rank, ticker in enumerate(picks, start=1):
+            row[f"rank_{rank:02d}"] = ticker
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(save_path, index=False)
+    print(f"\nTop-10 history saved -> {save_path}")
+
+
 # ---- 7. Visualization --------------------------------------------------------
 
 def plot_results(results, save_path):
@@ -684,12 +707,17 @@ def main():
     print("  " + ", ".join(any_top10[-1]))
 
     # 6. Save outputs
+    # Top-10 history is persona-independent (Layer 2 picks are shared)
+    top10_hist = next(iter(top10_by_persona.values()))
+    top10_path = RESULTS_DIR / "dual_agent_top10_history.csv"
+    save_top10_history(top10_hist, oos_dates, top10_path)
+
     if len(results_by_persona) == 1:
         name, results = next(iter(results_by_persona.items()))
         csv_path  = RESULTS_DIR / "dual_agent_backtest.csv"
         plot_path = RESULTS_DIR / "dual_agent_backtest.png"
         results.to_csv(csv_path, index=False)
-        print(f"\nMonthly results saved -> {csv_path}")
+        print(f"Monthly results saved -> {csv_path}")
         plot_results(results, plot_path)
     else:
         # Combined CSV (persona column) + overlaid comparison chart
@@ -700,7 +728,7 @@ def main():
         csv_path  = RESULTS_DIR / "dual_agent_comparison.csv"
         plot_path = RESULTS_DIR / "dual_agent_comparison.png"
         combined.to_csv(csv_path, index=False)
-        print(f"\nMonthly results saved -> {csv_path}")
+        print(f"Monthly results saved -> {csv_path}")
         plot_comparison(results_by_persona, plot_path)
 
     print("\nDone.")
